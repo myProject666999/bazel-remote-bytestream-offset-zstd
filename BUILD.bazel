@@ -1,0 +1,204 @@
+load("@gazelle//:def.bzl", "gazelle")
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+
+gazelle(
+    name = "gazelle",
+    prefix = "github.com/buchgr/bazel-remote/v2",
+)
+
+go_library(
+    name = "go_default_library",
+    srcs = ["main.go"],
+    importpath = "github.com/buchgr/bazel-remote/v2",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//cache/disk:go_default_library",
+        "//config:go_default_library",
+        "//ldap:go_default_library",
+        "//server:go_default_library",
+        "//utils/authcache:go_default_library",
+        "//utils/flags:go_default_library",
+        "//utils/idle:go_default_library",
+        "//utils/rlimit:go_default_library",
+        "@com_github_abbot_go_http_auth//:go_default_library",
+        "@com_github_grpc_ecosystem_go_grpc_prometheus//:go_default_library",
+        "@com_github_prometheus_client_golang//prometheus/promhttp:go_default_library",
+        "@com_github_slok_go_http_metrics//metrics/prometheus:go_default_library",
+        "@com_github_slok_go_http_metrics//middleware:go_default_library",
+        "@com_github_slok_go_http_metrics//middleware/std:go_default_library",
+        "@com_github_urfave_cli_v2//:go_default_library",
+        "@org_golang_google_grpc//:go_default_library",
+        "@org_golang_google_grpc//credentials:go_default_library",
+        "@org_golang_x_sync//errgroup:go_default_library",
+        "@org_golang_x_sync//semaphore:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "bazel-remote",
+    cgo = True,
+    embed = [":go_default_library"],
+    pure = "off",
+    static = "off",
+    visibility = ["//visibility:public"],
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
+)
+
+go_binary(
+    name = "bazel-remote-linux-amd64",
+    cgo = True,
+    embed = [":go_default_library"],
+    goarch = "amd64",
+    goos = "linux",
+    pure = "off",
+    static = "off",
+    visibility = ["//visibility:public"],
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
+)
+
+go_binary(
+    name = "bazel-remote-linux-arm64",
+    cgo = True,
+    embed = [":go_default_library"],
+    goarch = "arm64",
+    goos = "linux",
+    pure = "off",
+    static = "on",
+    visibility = ["//visibility:public"],
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
+)
+
+go_binary(
+    name = "bazel-remote-darwin-amd64",
+    cgo = True,
+    embed = [":go_default_library"],
+    goarch = "amd64",
+    goos = "darwin",
+    pure = "off",
+    #static = "on", # With static enabled, I get the following error: "ld: library not found for -lcrt0.o"
+    visibility = ["//visibility:public"],
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
+)
+
+go_binary(
+    name = "bazel-remote-darwin-arm64",
+    cgo = True,
+    embed = [":go_default_library"],
+    goarch = "arm64",
+    goos = "darwin",
+    pure = "off",
+    #static = "on", # With static enabled, I get the following error: "ld: library not found for -lcrt0.o"
+    visibility = ["//visibility:public"],
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
+)
+
+# The distroless static container image's nonroot user id.
+BAZEL_REMOTE_USER_ID = 65532
+
+pkg_tar(
+    name = "bazel-remote-linux-amd64_tar",
+    srcs = [":bazel-remote-linux-amd64"],
+)
+
+oci_image(
+    name = "bazel-remote-image",
+    base = "@cgo_amd64_base",  # Does not include openssl.
+    entrypoint = [
+        "/bazel-remote-linux-amd64",
+        "--http_address=:8080",
+        "--dir=/data",
+
+        # Listen on all addresses, not just 127.0.0.1, so this can
+        # be reached from outside the container (with a -p mapping).
+        # Specify a port to enable the profiling http server.
+        "--profile_address=:6060",
+    ],
+    exposed_ports = ["8080"],
+    tars = [
+        "data.tar",
+        ":bazel-remote-linux-amd64_tar",
+    ],
+    user = str(BAZEL_REMOTE_USER_ID),
+    visibility = ["//visibility:public"],
+)
+
+oci_load(
+    name = "bazel-remote-image-tarball",
+    image = ":bazel-remote-image",
+    repo_tags = ["buchgr/bazel-remote-cache:tmp-amd64"],
+)
+
+pkg_tar(
+    name = "bazel-remote-linux-arm64_tar",
+    srcs = [":bazel-remote-linux-arm64"],
+)
+
+oci_image(
+    name = "bazel-remote-image-arm64",
+    base = "@cgo_arm64_base",  # Does not include openssl.
+    entrypoint = [
+        "/bazel-remote-linux-arm64",
+        "--http_address=:8080",
+        "--dir=/data",
+
+        # Listen on all addresses, not just 127.0.0.1, so this can
+        # be reached from outside the container (with a -p mapping).
+        # Specify a port to enable the profiling http server.
+        "--profile_address=:6060",
+    ],
+    exposed_ports = ["8080"],
+    tars = [
+        "data.tar",
+        ":bazel-remote-linux-arm64_tar",
+    ],
+    user = str(BAZEL_REMOTE_USER_ID),
+    visibility = ["//visibility:private"],
+)
+
+oci_load(
+    name = "bazel-remote-image-arm64-tarball",
+    image = ":bazel-remote-image-arm64",
+    repo_tags = ["buchgr/bazel-remote-cache:tmp-arm64"],
+)
+
+# The following container_push targets push to "tmp-amd64" and "tmp-arm64"
+# tags, so they can be combined into a multiarch tag on dockerhub. This
+# isn't currently possible with rules_docker, so instead we rely on some
+# external commands to be run after the tmp-* tags are pushed. See the
+# docker/push_to_dockerhub script.
+#
+# Background:
+# https://github.com/bazelbuild/rules_docker/issues/1599
+
+oci_push(
+    name = "push_to_dockerhub_amd64",
+    image = ":bazel-remote-image",
+    remote_tags = ["tmp-amd64"],
+    repository = "buchgr/bazel-remote-cache",
+    visibility = ["//visibility:public"],
+)
+
+oci_push(
+    name = "push_to_dockerhub_arm64",
+    image = ":bazel-remote-image-arm64",
+    remote_tags = ["tmp-arm64"],
+    repository = "buchgr/bazel-remote-cache",
+    visibility = ["//visibility:public"],
+)

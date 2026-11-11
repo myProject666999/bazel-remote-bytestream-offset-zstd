@@ -1,0 +1,24 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "flags.go",
+        "usage.go",
+    ],
+    importpath = "github.com/buchgr/bazel-remote/v2/utils/flags",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cache/azblobproxy:go_default_library",
+        "//cache/disk/zstdimpl:go_default_library",
+        "//cache/s3proxy:go_default_library",
+        "@com_github_urfave_cli_v2//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["usage_test.go"],
+    embed = [":go_default_library"],
+    deps = ["@com_github_urfave_cli_v2//:go_default_library"],
+)
