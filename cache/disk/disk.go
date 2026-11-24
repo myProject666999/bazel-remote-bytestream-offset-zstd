@@ -623,8 +623,13 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	if offset < 0 {
 		return nil, -1, badReqErr("Invalid offset: %d", offset)
 	}
-	if size > 0 && offset >= size {
+	if size > 0 && offset > size {
 		return nil, -1, badReqErr("Invalid offset: %d for size %d", offset, size)
+	}
+	if size > 0 && offset == size {
+		// An offset exactly at the end of the blob is a valid empty read
+		// (matching the ByteStream Read contract), not a bad request.
+		return io.NopCloser(bytes.NewReader(nil)), size, nil
 	}
 
 	var err error

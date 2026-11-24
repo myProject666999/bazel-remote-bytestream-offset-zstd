@@ -125,8 +125,12 @@ func (s *grpcServer) GetCapabilities(ctx context.Context,
 					},
 				},
 			},
-			MaxBatchTotalSizeBytes:          0, // "no limit"
-			SymlinkAbsolutePathStrategy:     pb.SymlinkAbsolutePathStrategy_ALLOWED,
+			MaxBatchTotalSizeBytes:      0, // "no limit"
+			SymlinkAbsolutePathStrategy: pb.SymlinkAbsolutePathStrategy_ALLOWED,
+			// Keep these compressor sets in sync with the literal accepted
+			// by parseReadResource/parseWriteResource ("zstd"). The test
+			// TestBnd15778_CompressorSetsMatchCapabilities fails if only one
+			// side is updated.
 			SupportedCompressors:            []pb.Compressor_Value{pb.Compressor_ZSTD},
 			SupportedBatchUpdateCompressors: []pb.Compressor_Value{pb.Compressor_ZSTD},
 			MaxCasBlobSizeBytes:             s.maxCasBlobSizeBytes,

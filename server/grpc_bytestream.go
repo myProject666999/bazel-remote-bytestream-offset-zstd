@@ -53,46 +53,38 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		return err
 	}
 
-	if size == 0 {
-		if cmp == casblob.Identity {
-			s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s", req.ResourceName)
-			return nil
-		}
-
-		// The client asked for a zstd-compressed empty blob. Weird.
-		err := resp.Send(&bytestream.ReadResponse{Data: emptyZstdBlob})
-		if err != nil {
-			msg := fmt.Sprintf("GRPC BYTESTREAM READ FAILED TO SEND RESPONSE: %s %v", hash, err)
-			s.accessLogger.Printf(msg)
-			return status.Error(codes.Unknown, msg)
-		}
-		s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s", req.ResourceName)
-		return nil
-	}
-
+	// Validate the offset and limit before any size==0 special case, so
+	// that empty blobs enforce the same boundaries as non-empty ones.
+	//
+	// ByteStream offset contract (google/bytestream/bytestream.proto,
+	// ReadRequest.read_offset): a negative offset, or an offset greater
+	// than the size of the resource, is an error. An offset equal to the
+	// resource size is explicitly not in the error set ("negative or
+	// greater than the size"), and produces a successful empty read.
 	if req.ReadOffset < 0 {
 		s.accessLogger.Printf("GRPC BYTESTREAM READ OFFSET INVALID: %s %d",
-			req.ReadOffset)
+			req.ResourceName, req.ReadOffset)
 		return status.Error(codes.InvalidArgument,
 			"Negative ReadOffset is invalid")
 	}
 
+	// REAPI requires ReadLimit to be zero for compressed-blobs resources.
+	// This check takes precedence over the negative-ReadLimit rule below:
+	// a negative value is still non-zero, and REAPI mandates
+	// INVALID_ARGUMENT for any non-zero value.
 	if cmp != casblob.Identity && req.ReadLimit != 0 {
 		s.accessLogger.Printf("GRPC BYTESTREAM READ LIMIT INVALID: %s %d",
-			req.ReadLimit)
+			req.ResourceName, req.ReadLimit)
 		return status.Error(codes.InvalidArgument,
 			"ReadLimit must be 0 for compressed-blobs")
 	}
 
 	if req.ReadLimit < 0 {
 		s.accessLogger.Printf("GRPC BYTESTREAM READ LIMIT OUT OF RANGE: %s %d",
-			req.ReadLimit)
+			req.ResourceName, req.ReadLimit)
 		return status.Error(codes.OutOfRange,
 			"Negative ReadLimit is out of range")
 	}
-
-	limitedSend := (req.ReadLimit != 0) && cmp == casblob.Identity
-	sendLimitRemaining := req.ReadLimit
 
 	if req.ReadOffset > size {
 		msg := fmt.Sprintf("ReadOffset %d larger than expected data size %d resource: %s",
@@ -100,6 +92,37 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		s.accessLogger.Printf("GRPC BYTESTREAM READ FAILED %s: %s", hash, msg)
 		return status.Error(codes.OutOfRange, msg)
 	}
+
+	if req.ReadOffset == size {
+		// Read starting exactly at the end of the blob: return an empty
+		// response stream and OK. Handled explicitly here so the behavior
+		// is independent of the cache backend's offset contract (the disk
+		// cache also accepts offset == size and returns an empty reader),
+		// and so the compressed empty-blob frame below stays intact.
+		if size == 0 && cmp == casblob.Zstandard {
+			// The client asked for a zstd-compressed empty blob. Keep
+			// returning the conventional one-frame empty zstd payload
+			// instead of zero messages.
+			err := resp.Send(&bytestream.ReadResponse{Data: emptyZstdBlob})
+			if err != nil {
+				msg := fmt.Sprintf("GRPC BYTESTREAM READ FAILED TO SEND RESPONSE: %s %v", hash, err)
+				s.accessLogger.Printf(msg)
+				return status.Error(codes.Unknown, msg)
+			}
+		}
+		s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s", req.ResourceName)
+		return nil
+	}
+
+	// Note about compressed-blobs offsets (REAPI, "Downloading compressed
+	// blobs"): ReadRequest.read_offset is an offset in the *uncompressed*
+	// form of the blob, and that is the unit used here and by
+	// casblob.GetZstdReadCloser/GetUncompressedReadCloser (the casblob
+	// chunk table records uncompressed chunk positions). For a
+	// zstd-compressed response, the returned stream is re-encoded from
+	// the chunk containing the offset when the offset is not chunk
+	// aligned. This matches the REAPI text; do not reinterpret the offset
+	// as a compressed-byte position.
 
 	var rc io.ReadCloser
 	var foundSize int64
@@ -141,17 +164,25 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 
 	buf := make([]byte, bufSize)
 
+	// ReadLimit is documented by ByteStream as the maximum number of data
+	// bytes the server may return in total (zero means unlimited). It is a
+	// cap: once exactly ReadLimit bytes have been sent the read completes
+	// successfully, instead of failing with OutOfRange. REAPI forbids a
+	// non-zero limit for compressed-blobs resources, handled above.
+	limitedSend := (req.ReadLimit != 0) && cmp == casblob.Identity
+	sendLimitRemaining := req.ReadLimit
+
 	var chunkResp bytestream.ReadResponse
 	for {
-		n, err := rc.Read(buf)
+		readBuf := buf
+		if limitedSend && sendLimitRemaining < int64(len(readBuf)) {
+			readBuf = readBuf[:sendLimitRemaining]
+		}
+
+		n, err := rc.Read(readBuf)
 
 		if n > 0 {
 			if limitedSend {
-				if (sendLimitRemaining - int64(n)) < 0 {
-					msg := fmt.Sprintf("GRPC BYTESTREAM READ FAILED: %s READ LIMIT EXCEEDED", hash)
-					s.accessLogger.Printf(msg)
-					return status.Error(codes.OutOfRange, msg)
-				}
 				sendLimitRemaining -= int64(n)
 			}
 
@@ -162,6 +193,13 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 				s.accessLogger.Printf(msg)
 				return status.Error(codes.Unknown, msg)
 			}
+		}
+
+		if limitedSend && sendLimitRemaining == 0 {
+			// Delivered at most ReadLimit bytes, as requested.
+			s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s",
+				req.ResourceName)
+			return nil
 		}
 
 		if err == io.EOF {
@@ -418,6 +456,11 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				exists, _ := s.cache.Contains(srv.Context(), cache.CAS, hash, size)
 				if exists {
 					// Blob already exists, return without writing anything.
+					// This existence check intentionally runs before the
+					// WriteOffset check below: per REAPI, a duplicate upload
+					// of a completed blob terminates successfully regardless
+					// of the offset. CommittedSize is the full size for
+					// uncompressed resources and -1 for compressed ones.
 					if cmp == casblob.Identity {
 						resp.CommittedSize = size
 					} else {
@@ -429,6 +472,8 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
 				resp.CommittedSize = req.WriteOffset
 				if req.WriteOffset != 0 {
+					// No resumable writes: only a zero offset is accepted
+					// for a blob that does not already exist.
 					err = errWriteOffset
 					s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s", err)
 					recvResult <- err
@@ -603,8 +648,15 @@ func (s *grpcServer) QueryWriteStatus(ctx context.Context, req *bytestream.Query
 		return nil, err
 	}
 
-	// We don't support partial writes, so the status will either be fully written
-	// and complete, or 0 written and incomplete.
+	// This deployment intentionally does not implement resumable/concurrent
+	// partial writes: Write rejects every non-zero WriteOffset (see
+	// errWriteOffset). Consequently the status has exactly two shapes:
+	//   - not committed yet: {CommittedSize: 0, Complete: false}
+	//   - fully written:    {CommittedSize: <declared size>, Complete: true}
+	// The incomplete response always reports zero, which is the only write
+	// offset this server accepts; it must never be read as a resumable
+	// partial cursor. The check is purely existence based, so it agrees
+	// with Write's already-exists short circuit below.
 
 	exists, _ := s.cache.Contains(ctx, cache.CAS, hash, size)
 

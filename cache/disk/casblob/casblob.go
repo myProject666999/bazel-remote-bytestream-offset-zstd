@@ -585,6 +585,25 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 					hash, actualHash)
 		}
 
+		// There is a single uncompressed chunk starting right after the
+		// header. Finalize the offset table (whose last entry is the total
+		// file size), otherwise readHeader rejects the file.
+		h.chunkOffsets[0] = h.size()
+		h.chunkOffsets[1] = h.size() + n
+		_, err = f.Seek(chunkTableOffset, io.SeekStart)
+		if err != nil {
+			return -1, fmt.Errorf("failed to seek to offset %d: %w", chunkTableOffset, err)
+		}
+		err = binary.Write(f, binary.LittleEndian, h.chunkOffsets)
+		if err != nil {
+			return -1, fmt.Errorf("failed to write chunk offsets: %w", err)
+		}
+
+		err = f.Sync()
+		if err != nil {
+			return -1, fmt.Errorf("failed to sync file: %w", err)
+		}
+
 		return n + fileOffset, f.Close()
 	}
 
